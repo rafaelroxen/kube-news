@@ -42,13 +42,13 @@ jobs:
   
   CD:
     runs-on: ubuntu-latest
-     steps:
+    steps:
       - uses: actions/checkout@v3
       - name: Kubernetes Set Context
         uses: Azure/k8s-set-context@v3.0
         with:
           method: kubeconfig
-          kubeconfig: ${{K8S_CONFIG}}
+          kubeconfig: ${{secrets.K8S_CONFIG}}
           
       - name: Deploy to Kubernetes cluster
         uses: Azure/k8s-deploy@v4.3
