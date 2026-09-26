@@ -1,60 +1,171 @@
-# This is a basic workflow to help you get started with Actions
-
 name: CI-CD
 
-# Controls when the workflow will run
+# PR para main: valida (scan + build sem push).
+# Merge/push na main: build, push da imagem e commit da nova tag em apps-experimentos (o Argo CD faz o deploy).
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
+  pull_request:
+    branches: [main]
   push:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: [main]
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
+env:
+  IMAGE: rafaelroxen/kube-news
+
 jobs:
-  # This workflow contains a single job called "build"
-  CI:
-    # The type of runner that the job will run on
+  scan:
     runs-on: ubuntu-latest
-    
     steps:
-
-      - uses: actions/checkout@v3
-
-      - name: Autenticando o usuario no Docker
-        uses: docker/login-action@v2.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          username: ${{secrets.DOCKERHUB_USER}}
-          password: ${{secrets.DOCKERHUB_PWD}}
-          #Esta variável está em Settings, Secrets -> Actions.
-          
-          
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v3.1.1
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          file: ./src/Dockerfile
+          node-version: 16
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - name: Instalar dependências
+        working-directory: src
+        run: npm ci
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: npm audit (relatório)
+        working-directory: src
+        run: npm audit --omit=dev --audit-level=critical
+        continue-on-error: true
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: src/Dockerfile
+          failure-threshold: error
+
+      - name: Trivy filesystem (relatório)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: src
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+  build:
+    needs: scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build local para scan (cache de camadas)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
           context: ./src
+          file: ./src/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy imagem (relatório)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Trivy imagem (SARIF)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Enviar SARIF para a aba Security
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Login no Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_PWD }}
+
+      - name: Push (tag imutável, SBOM e provenance)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./src
+          file: ./src/Dockerfile
           push: true
-          tags: |
-            rafaelroxen/kube-news:latest
-            rafaelroxen/kube-news:${{github.run_number}}
-  
-  CD:
+          provenance: true
+          sbom: true
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
     runs-on: ubuntu-latest
-    needs: [CI]
+    concurrency:
+      group: deploy-prd
+      cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v3
-      - name: Definindo o Kube Config, que é gerado o arquivo do Terraform
-        uses: Azure/k8s-set-context@v3.0
-        with:
-          method: kubeconfig
-          kubeconfig: ${{secrets.K8S_CONFIG}}
-          
-      - name: Efetuando o Deploy no Kubernetes
-        uses: Azure/k8s-deploy@v4.3
-        with:
-          images: rafaelroxen/kube-news:${{github.run_number}}
-          manifests: |
-            ./k8s/deployment.yaml
-    
+      - name: Configurar SSH (deploy key com escrita só em apps-experimentos)
+        env:
+          GITOPS_DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$GITOPS_DEPLOY_KEY" > ~/.ssh/id_gitops
+          chmod 600 ~/.ssh/id_gitops
+          # Chave pública do host github.com (https://api.github.com/meta)
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/id_gitops -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+
+      - name: Atualizar image.tag em apps-experimentos
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[0-9a-f]{7}$ ]]
+          git clone --depth 1 git@github.com:rafaelroxen/apps-experimentos.git gitops
+          cd gitops
+          git config user.name "kube-news-pipeline"
+          git config user.email "kube-news-pipeline@users.noreply.github.com"
+          f=apps/values.yaml
+          test "$(grep -c '{name: image.tag, value: ' "$f")" -eq 1
+          sed -i -E "s|(\{name: image\.tag, value: )[^}]*(\})|\1${TAG}\2|" "$f"
+          if git diff --quiet; then echo "Tag já é ${TAG}; nada a fazer."; exit 0; fi
+          git commit -am "chore(deploy): cadastro-de-vendas-prd ${TAG}"
+          for i in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1
